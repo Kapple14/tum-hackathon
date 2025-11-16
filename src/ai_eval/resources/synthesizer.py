@@ -91,23 +91,23 @@ class TestDatasetCreator(Preprocessor):
         )
 
         # Without memory:
-        # self.generated_questions = generate_qa_couples(
-        #     self.docs_processed,
-        #     prompt,
-        #     self.qa_generator_llm,
-        #     n_generations,
-        #     with_replacement=with_replacement,
-        # )
-
-        # With memory:
-        self.generated_questions = generate_qa_memory(
+        self.generated_questions = generate_qa_couples(
             self.docs_processed,
             prompt,
             self.qa_generator_llm,
             n_generations,
-            self.sampled_contexts,
             with_replacement=with_replacement,
         )
+
+        # With memory:
+        # self.generated_questions = generate_qa_memory(
+        #     self.docs_processed,
+        #     prompt,
+        #     self.qa_generator_llm,
+        #     n_generations,
+        #     self.sampled_contexts,
+        #     with_replacement=with_replacement,
+        # )
 
     def evaluate_qa_pairs(self) -> None:
         """
@@ -164,7 +164,9 @@ class TestDatasetCreator(Preprocessor):
             ]
         ]
 
-        print(f"Filtered QA pairs: {len(self.generated_qa)} out of {len(self.outputs)}")
+        my_logger.info(
+            f"Filtered QA pairs: {len(self.generated_qa)} out of {len(self.outputs)}"
+        )
 
 
 class Synthesizer(TestDatasetCreator):
@@ -173,7 +175,7 @@ class Synthesizer(TestDatasetCreator):
         qa_generator: LLM,
         eval_model: LLM,
         blob_path: Optional[str] = None,
-        source: str = "gcp",
+        source: str = "local",
         verbose: bool = True,
     ):
         """
