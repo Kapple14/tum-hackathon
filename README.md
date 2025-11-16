@@ -17,9 +17,6 @@ This repository contains the code utilities and examples developed for the **TUM
 ├── data/                         # Document corpus and generated datasets
 │   ├── Allplan_2020_Manual.pdf
 │   ├── generated_qa_data_tum.json
-│   ├── generated_qa_data_allplan_tum.json
-│   ├── deepeval_results.json
-│   └── tmp/
 ├── src/
 │   ├── ai_eval/                  # Core evaluation framework
 │   │   ├── config/               # Configuration management
@@ -395,33 +392,12 @@ class CustomRAG:
 
 ### Example Workflow
 
-See `src/notebooks/prepare_tum_hackathon.ipynb` for a complete end-to-end example:
-
-1. Generate synthetic QA dataset from documents
-2. Save ground truth as JSON (`generated_qa_data_tum.json`)
-3. Load documents and create document chunks
-4. Initialize custom RAG model (TF-IDF example)
-5. Build evaluation dataset (runs RAG on all test queries)
-6. Calculate evaluation metrics
-7. Analyze results and iterate on RAG design
-
-## ToDos - next steps
-
-- Try speeding up the API call by converting synchronous to asynchronous calls where possible
-
-- Add chat history (requests + answers) to Firestore, maybe add new collection
-
-- Add user login + authentication
-
-- Add st.download_button to download generated data set
-
-- Add unit tests for methods
-
-- Add third tab for RAG calling on the generated test set
-
-- Create KPIs based on DeepEval or RAGAS (?)
-
-- Push created (annotated) test data to LangFuse automatically as part of e2e pipeline
+1. Read ground truth as JSON (`generated_qa_data_tum.json`)
+2. Load documents and create document chunks
+3. Initialize custom RAG model (TF-IDF example)
+4. Build evaluation dataset (runs RAG on all test queries)
+5. Calculate evaluation metrics
+6. Analyze results and iterate on RAG design
 
 
 
