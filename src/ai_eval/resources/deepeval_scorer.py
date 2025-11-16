@@ -30,13 +30,14 @@ class DeepEvalScorer:
         :param evaluation_dataset: The dataset to evaluate, created using the Predictor class.
         """
         self.evaluation_dataset = evaluation_dataset
+        self.results = None  # Initialize results to None
         # Do NOT rebuild the evaluation dataset here; just use the provided one.
-        
+
         # Get the first configured output service (Opik or Langfuse)
         output_services = config.io["output"]["service"]
         service_name = next(iter(output_services.keys()))  # Get first service
         config_out = output_services[service_name]
-        
+
         self.metric_config = config_out["metrics"]
         self.models = InitModels()
         self.deepeval_model = LangChainDeepEvalModel(model=self.models.eval_model)
