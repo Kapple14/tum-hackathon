@@ -11,22 +11,25 @@ This repository contains the code utilities and examples developed for the **TUM
 
 ```
 ├── .env                          # Environment configuration (GCP credentials)
+├── .gitignore                    # Git ignore patterns
 ├── pyproject.toml                # Python package configuration
 ├── requirements.txt              # Pip-compatible dependencies
 ├── uv.lock                       # UV dependency lock file
 ├── data/                         # Document corpus and generated datasets
-│   ├── Allplan_2020_Manual.pdf
-│   ├── generated_qa_data_tum.json
+│   ├── Allplan_2020_Manual.pdf           # Construction software manual
+│   ├── generated_qa_data_tum.json        # Generated Q&A dataset (JSON)
 ├── src/
 │   ├── ai_eval/                  # Core evaluation framework
 │   │   ├── config/               # Configuration management
+│   │   │   ├── __init__.py
 │   │   │   ├── config.py
 │   │   │   ├── global_config.py  # Environment variables & settings
 │   │   │   ├── input_output.yaml
 │   │   │   └── model_config.yaml
 │   │   ├── resources/            # RAG and evaluation components
+│   │   │   ├── __init__.py
 │   │   │   ├── synthesizer.py    # QA data generation
-│   │   │   ├── rag_template.py   # RAG model templates (TF-IDF, etc.)
+│   │   │   ├── rag_template.py   # RAG model templates (TF-IDF, FAISS)
 │   │   │   ├── deepeval_scorer.py # Evaluation metrics
 │   │   │   ├── eval_dataset_builder.py
 │   │   │   ├── get_models.py     # Vertex AI model initialization
@@ -35,15 +38,15 @@ This repository contains the code utilities and examples developed for the **TUM
 │   │   │   ├── llm_aaj.py        # LLM utilities
 │   │   │   └── data_schemas.py
 │   │   ├── services/             # Infrastructure services
+│   │   │   ├── __init__.py
 │   │   │   ├── logger.py         # Centralized logging
-│   │   │   ├── database.py       # Firestore integration
-│   │   │   ├── file.py           # File operations
+│   │   │   ├── file.py           # File I/O operations (JSON, Excel)
 │   │   │   └── blueprint_file.py
 │   │   └── utils/                # Helper utilities
+│   │       ├── __init__.py
 │   │       └── utils.py
 │   └── notebooks/                # Example workflows
 │       └── prepare_tum_hackathon.ipynb  # End-to-end RAG evaluation demo
-└── tests/                        # Unit tests
 ```
 
 ## Package installation and application development
