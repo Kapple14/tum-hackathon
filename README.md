@@ -157,6 +157,39 @@ pip install -e ".[dev]"
 
 This installs additional tools like `jupyter`, `pytest`, and `pytest-timeout` for testing and development.
 
+## Dataset Schema
+
+The generated Q&A dataset (`generated_qa_data_tum.json`) contains synthetic test cases for RAG evaluation. Each record has the following fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `index` | `int` | Unique identifier for the test case (0-based) |
+| `question` | `string` | The synthetic question generated from the document context |
+| `answer` | `string` | The expected ground truth answer to the question |
+| `context` | `string` | The source text passage from which the Q&A pair was generated |
+| `location_dependency_evaluator_target_answer` | `string` | Target answer used for location dependency evaluation (typically same as `answer`) |
+| `groundedness_score` | `int` | Score (1-5) evaluating how well the context supports the answer |
+| `groundedness_eval` | `string` | Explanation of the groundedness score |
+| `question_relevancy_score` | `int` | Score (1-5) evaluating the question's relevance to Nemetschek business/products |
+| `question_relevancy_eval` | `string` | Explanation of the relevancy score |
+| `faithfulness_score` | `int` | Score (1-5) evaluating if the answer is faithful to the context (no hallucinations) |
+| `faithfulness_eval` | `string` | Explanation of the faithfulness score |
+
+**Example record:**
+```json
+{
+  "index": 0,
+  "question": "How can I control the height of a pattern element in the layout?",
+  "answer": "You must enter a factor in the pattern parameters...",
+  "context": "186 Pattern and scale Allplan 2020...",
+  "groundedness_score": 5,
+  "groundedness_eval": "The context directly explains...",
+  "question_relevancy_score": 5,
+  "question_relevancy_eval": "This question is highly specific to Allplan...",
+  "faithfulness_score": 5,
+  "faithfulness_eval": "The answer accurately reflects..."
+}
+```
 
 ## Building and Evaluating Custom RAG Models
 
