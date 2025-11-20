@@ -1,4 +1,4 @@
-# TUM Hackathon - RAG Evaluation Framework
+# AEC/O Hackathon 2025 Munich Edition
 
 This repository contains the code utilities and examples developed for the **TUM Hackathon**, focused on building and evaluating Retrieval-Augmented Generation (RAG) systems. It provides a complete pipeline for:
 
