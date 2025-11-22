@@ -421,3 +421,120 @@ class TestQASimpleValidation:
 
         assert high_result["confidence"] >= MIN_CONFIDENCE_THRESHOLD
         assert low_result["confidence"] < MIN_CONFIDENCE_THRESHOLD
+
+    def test_json_format_strict_validation(self):
+        """Test that JSON format validation handles missing fields and malformed responses."""
+
+        class StubLLM:
+            def __init__(self, payload: str | Dict[str, float | bool | str]):
+                self.payload = payload
+
+            def invoke(self, prompt: str):  # noqa: ARG002 - prompt logged implicitly
+                if isinstance(self.payload, dict):
+                    return type("Resp", (), {"content": json.dumps(self.payload)})
+                return type("Resp", (), {"content": self.payload})
+
+        # Test 1: Complete valid JSON with all required fields
+        complete_stub = StubLLM(
+            {
+                "confidence": 0.85,
+                "is_correct": True,
+                "semantic_match": 0.90,
+                "reasoning": "Perfect match.",
+            }
+        )
+        result = validate_answer_with_claude(
+            question="Test question",
+            answer="Test answer",
+            context="Test context",
+            target_answer="Test target",
+            llm=complete_stub,  # type: ignore[arg-type]
+        )
+        assert result["confidence"] == 0.85
+        assert result["is_correct"] is True
+        assert result["semantic_match"] == 0.90
+        assert result["reasoning"] == "Perfect match."
+
+        # Test 2: Missing required fields (should use defaults)
+        missing_fields_stub = StubLLM({"confidence": 0.75})
+        result = validate_answer_with_claude(
+            question="Test question",
+            answer="Test answer",
+            context="Test context",
+            target_answer="Test target",
+            llm=missing_fields_stub,  # type: ignore[arg-type]
+        )
+        assert result["confidence"] == 0.75
+        assert result["is_correct"] is False  # Default value
+        assert result["semantic_match"] == 0.0  # Default value
+        assert result["reasoning"] == ""  # Default value
+
+        # Test 3: Invalid JSON (should return low confidence)
+        invalid_json_stub = StubLLM("This is not valid JSON {")
+        result = validate_answer_with_claude(
+            question="Test question",
+            answer="Test answer",
+            context="Test context",
+            target_answer="Test target",
+            llm=invalid_json_stub,  # type: ignore[arg-type]
+        )
+        assert result["confidence"] == 0.3  # Error fallback value
+        assert result["is_correct"] is False
+        assert "Failed to parse" in result["reasoning"]
+
+        # Test 4: JSON wrapped in markdown code blocks
+        markdown_stub = StubLLM(
+            '```json\n{"confidence": 0.80, "is_correct": true, "semantic_match": 0.85, "reasoning": "Good match."}\n```'
+        )
+        result = validate_answer_with_claude(
+            question="Test question",
+            answer="Test answer",
+            context="Test context",
+            target_answer="Test target",
+            llm=markdown_stub,  # type: ignore[arg-type]
+        )
+        assert result["confidence"] == 0.80
+        assert result["is_correct"] is True
+        assert result["semantic_match"] == 0.85
+
+        # Test 5: Values outside valid range (should be clamped)
+        out_of_range_stub = StubLLM(
+            {
+                "confidence": 1.5,  # Above 1.0
+                "is_correct": True,
+                "semantic_match": -0.5,  # Below 0.0
+                "reasoning": "Test",
+            }
+        )
+        result = validate_answer_with_claude(
+            question="Test question",
+            answer="Test answer",
+            context="Test context",
+            target_answer="Test target",
+            llm=out_of_range_stub,  # type: ignore[arg-type]
+        )
+        assert result["confidence"] == 1.0  # Clamped to max
+        assert result["semantic_match"] == 0.0  # Clamped to min
+
+        # Test 6: Extra fields (should be ignored, not cause errors)
+        extra_fields_stub = StubLLM(
+            {
+                "confidence": 0.75,
+                "is_correct": True,
+                "semantic_match": 0.80,
+                "reasoning": "Test",
+                "extra_field": "should be ignored",
+                "another_extra": 123,
+            }
+        )
+        result = validate_answer_with_claude(
+            question="Test question",
+            answer="Test answer",
+            context="Test context",
+            target_answer="Test target",
+            llm=extra_fields_stub,  # type: ignore[arg-type]
+        )
+        # Should still work with extra fields
+        assert result["confidence"] == 0.75
+        assert "extra_field" not in result
+        assert "another_extra" not in result
