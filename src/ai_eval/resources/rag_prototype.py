@@ -67,6 +67,11 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from ai_eval.prompts.anti_preamble import (
+    ALLPLAN_QA_TEMPLATE,
+    ALLPLAN_REFINE_TEMPLATE,
+    select_prompt_template,
+)
 from ai_eval.resources.rag_template import RAG
 
 logger = logging.getLogger(__name__)
@@ -311,6 +316,10 @@ class RAGConfig(BaseSettings):
     streaming: bool = Field(
         default=False,
         description="Enable streaming responses",
+    )
+    use_direct_answer_prompts: bool = Field(
+        default=False,
+        description="Use anti-preamble Allplan prompt templates for concise answers",
     )
 
     # Advanced settings
@@ -1074,10 +1083,55 @@ class RAGPrototype(RAG):
             llama_llm = llm_to_use  # AnthropicMultiModal is already compatible
 
         self.query_engine = RetrieverQueryEngine.from_args(
-            retriever=self.retriever,
-            llm=llama_llm,
-            response_mode=self.config.response_mode.value,
+            **{
+                "retriever": self.retriever,
+                "llm": llama_llm,
+                "response_mode": self.config.response_mode.value,
+                **(
+                    {
+                        "text_qa_template": ALLPLAN_QA_TEMPLATE,
+                        "refine_template": ALLPLAN_REFINE_TEMPLATE,
+                    }
+                    if self.config.use_direct_answer_prompts
+                    else {}
+                ),
+            }
         )
+
+    def _apply_direct_answer_template(self, question: str) -> None:
+        """Update the QA template dynamically based on the question type."""
+        if not (self.config.use_direct_answer_prompts and self.query_engine):
+            return
+
+        template = select_prompt_template(question)
+        try:
+            self.query_engine.update_prompts(
+                {"response_synthesizer:text_qa_template": template}
+            )
+        except Exception as exc:  # noqa: BLE001 - surface for visibility
+            logger.warning(
+                "⚠️  Could not update prompt template for question '%s': %s",
+                question[:80],
+                exc,
+            )
+
+    def _post_process_answer(self, answer: str) -> str:
+        """Apply anti-preamble cleanup rules to generated answers."""
+        cleaned = answer.strip().strip("\"'")
+
+        if not self.config.use_direct_answer_prompts:
+            return cleaned
+
+        if cleaned.endswith("..."):
+            cleaned = cleaned[:-3].strip()
+
+        while cleaned.endswith(".."):
+            cleaned = cleaned[:-1]
+
+        if cleaned and cleaned[-1] not in ".!?":
+            cleaned += "."
+
+        return cleaned
 
     def _convert_to_llama_documents(
         self,
@@ -1222,12 +1276,19 @@ class RAGPrototype(RAG):
     ) -> str:
         """Generate answer (uses vision LLM if enabled)."""
         if self.query_engine is not None:
+            self._apply_direct_answer_template(question)
             response = self.query_engine.query(question)
-            return str(response)
+            return self._post_process_answer(str(response))
 
         # Fallback
         prompt = (
-            "Using the following context, answer the question:\n\n"
+            "Answer in 1-3 sentences (max 50 words) with direct, no-preamble style.\n"
+            "Start with 'You can', 'You must', 'To [action]', or the defined term.\n"
+            "Avoid meta-commentary and end with a period.\n\n"
+            if self.config.use_direct_answer_prompts
+            else "Using the following context, answer the question:\n\n"
+        )
+        prompt += (
             f"Context: {context}\n\n"
             f"Question: {question}\n\n"
             "Answer:"
@@ -1242,8 +1303,8 @@ class RAGPrototype(RAG):
 
         answer = llm_to_use.invoke(prompt)
         if hasattr(answer, "content"):
-            return answer.content  # type: ignore[return-value]
-        return str(answer)
+            return self._post_process_answer(answer.content)  # type: ignore[return-value]
+        return self._post_process_answer(str(answer))
 
     def answer(
         self,
