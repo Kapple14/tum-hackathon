@@ -78,10 +78,26 @@ def initialize_rag_system() -> RAGPrototype:
     """
     Initialize the multimodal RAG system using the Allplan manual,
     mirroring the setup from dual_evaluator_rag_pipeline.ipynb.
+
+    This will:
+    1. Load the Allplan PDF with multimodal LlamaParse (vision-based parsing)
+    2. Create embeddings with Jina v4 (multimodal embeddings)
+    3. Store in Qdrant vector database
+    4. Set up retriever with vision-capable Claude for generation
     """
 
-    logger.info("Initializing multimodal RAG system with Allplan manual corpus...")
+    logger.info(
+        "Initializing multimodal RAG system with Allplan manual corpus...")
     validate_required_keys()
+
+    # Check for optional LlamaParse API key
+    llamaparse_key = os.getenv("LLAMAPARSE_API_KEY")
+    if not llamaparse_key:
+        logger.warning(
+            "⚠️  LLAMAPARSE_API_KEY not found. "
+            "Multimodal parsing requires this key. "
+            "Will fall back to basic text extraction."
+        )
 
     config = RAGConfig(
         retrieval_mode=RetrievalMode.MULTIMODAL,
@@ -94,12 +110,22 @@ def initialize_rag_system() -> RAGPrototype:
         chunk_size=1024,
         chunk_overlap=200,
         top_k=5,
-        force_recreate=False,
+        force_recreate=False,  # Reuse existing embeddings if available
     )
 
     rag = RAGPrototype(config=config)
-    rag.ensure_manual_embeddings()
+
+    # Deploy embeddings with force_reload to ensure multimodal parsing is used
+    # This will reload the documents with LlamaParse if not already done
+    rag.ensure_manual_embeddings(force_reload=True)
+
     logger.info("✅ RAG system initialized and ready for solution generation")
+    logger.info(f"   📚 Documents: {len(rag._default_documents)}")
+    logger.info(f"   🔍 Retrieval: top-{config.top_k}")
+    logger.info(
+        f"   🧠 LLM: {config.llm_model.value} (vision: {config.vision_llm_model.value})")
+    logger.info(f"   📐 Embeddings: {config.embedding_model.value}")
+
     return rag
 
 

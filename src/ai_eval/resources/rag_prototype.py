@@ -25,6 +25,11 @@ from langchain.docstore.document import Document
 from langchain.document_loaders import PyPDFLoader
 
 try:  # pragma: no cover - optional dependency
+    from llama_parse import LlamaParse
+except ImportError:
+    LlamaParse = None  # type: ignore[assignment, misc]
+
+try:  # pragma: no cover - optional dependency
     from langchain_anthropic import ChatAnthropic
 except Exception as exc:  # noqa: BLE001 - surface downstream
     ChatAnthropic = None  # type: ignore[assignment]
@@ -850,6 +855,9 @@ class RAGPrototype(RAG):
         """
         Load the Allplan 2020 manual PDF into LangChain Documents.
 
+        Uses multimodal LlamaParse if parse_mode is MULTIMODAL_LVM,
+        otherwise falls back to basic PyPDFLoader.
+
         Args:
             corpus_path: Optional override for the manual path.
 
@@ -863,6 +871,85 @@ class RAGPrototype(RAG):
                 f"❌ Allplan manual PDF not found at {path}. Update corpus_pdf_path."
             )
 
+        # Check if multimodal parsing is requested
+        use_multimodal = (
+            self.config.parse_mode == ParseMode.MULTIMODAL_LVM
+            and self.config.retrieval_mode in [RetrievalMode.MULTIMODAL, RetrievalMode.HYBRID]
+        )
+
+        if use_multimodal:
+            return self._load_with_llamaparse(path)
+        else:
+            return self._load_with_pypdf(path)
+
+    def _load_with_llamaparse(self, path: Path) -> List[Document]:
+        """
+        Load PDF using LlamaParse with multimodal vision model.
+
+        Mirrors the setup from dual_evaluator_rag_pipeline.ipynb.
+        """
+        if LlamaParse is None:
+            raise ImportError(
+                "llama-parse is required for multimodal parsing. "
+                "Install it with: pip install llama-parse"
+            )
+
+        if not self.config.llamaparse_api_key:
+            raise ValueError(
+                "❌ llamaparse_api_key is required for multimodal parsing. "
+                "Set LLAMAPARSE_API_KEY in your .env file."
+            )
+
+        logger.info(
+            "🔄 Loading PDF with LlamaParse (multimodal vision parsing)..."
+        )
+
+        loader = LlamaParse(
+            parse_mode="parse_page_with_lvm",
+            model="anthropic-sonnet-4.0",
+            vendor_multimodal_api_key=self.config.anthropic_api_key,
+            api_key=self.config.llamaparse_api_key,
+        )
+
+        # Load documents
+        raw_docs = loader.load_data(str(path))
+        documents: List[Document] = []
+
+        for idx, doc in enumerate(raw_docs, start=1):
+            # LlamaParse documents expose .text
+            text = getattr(doc, "text", None)
+            if text is None:
+                text = getattr(doc, "page_content", "")
+
+            metadata = getattr(doc, "metadata", {}) or {}
+            metadata.update(
+                {
+                    "source": path.name,
+                    "source_path": str(path),
+                    "page": idx,
+                    "collection": self.config.collection_name,
+                    "parse_mode": "multimodal_lvm",
+                }
+            )
+
+            documents.append(
+                Document(
+                    page_content=text,
+                    metadata=metadata,
+                )
+            )
+
+        logger.info(
+            "📖 Loaded %d pages from Allplan manual (multimodal) at %s",
+            len(documents),
+            path,
+        )
+        return documents
+
+    def _load_with_pypdf(self, path: Path) -> List[Document]:
+        """Load PDF using basic PyPDFLoader for text-only mode."""
+        logger.info("📄 Loading PDF with PyPDFLoader (text-only mode)...")
+
         loader = PyPDFLoader(str(path))
         pages = loader.load()
         documents: List[Document] = []
@@ -875,6 +962,7 @@ class RAGPrototype(RAG):
                     "source_path": str(path),
                     "page": metadata.get("page", idx),
                     "collection": self.config.collection_name,
+                    "parse_mode": "basic",
                 }
             )
             documents.append(
@@ -885,18 +973,34 @@ class RAGPrototype(RAG):
             )
 
         logger.info(
-            "📖 Loaded %d pages from Allplan manual at %s",
+            "📖 Loaded %d pages from Allplan manual (text-only) at %s",
             len(documents),
             path,
         )
         return documents
 
-    def ensure_manual_embeddings(self) -> None:
-        """Deploy embeddings for the Allplan manual if not already available."""
-        if self._is_deployed:
+    def ensure_manual_embeddings(self, force_reload: bool = False) -> None:
+        """
+        Deploy embeddings for the Allplan manual if not already available.
+
+        Args:
+            force_reload: If True, reload documents and redeploy even if already deployed.
+                         Useful when switching parse modes (e.g., text-only → multimodal).
+        """
+        if self._is_deployed and not force_reload:
+            logger.info("✅ Embeddings already deployed, skipping...")
             return
+
+        if force_reload and self._is_deployed:
+            logger.info(
+                "🔄 Force reload requested - reloading documents and redeploying...")
+            # Reload documents with current parse mode
+            self._default_documents = self._load_allplan_manual_documents(
+                self.config.corpus_pdf_path
+            )
+
         logger.info("📦 Deploying Allplan manual corpus to Qdrant...")
-        self.deploy_embeddings()
+        self.deploy_embeddings(force_redeploy=force_reload)
 
     def switch_to_multimodal(
         self,
@@ -1166,23 +1270,21 @@ class RAGPrototype(RAG):
             raise ValueError(error_msg) from exc
 
     def _create_query_engine(self) -> None:
-        """Create query engine (uses vision LLM if available)."""
-        llm_to_use: Union[ChatAnthropic, AnthropicMultiModal] = (
-            self.vision_llm
-            if (self.config.enable_vision and self.vision_llm)
-            else self.llm
-        )
+        """
+        Create query engine using ChatAnthropic (text-based LLM).
 
-        if isinstance(llm_to_use, ChatAnthropic):
-            if LangChainLLM is None:
-                raise ImportError(
-                    "llama_index.llms.langchain is required to wrap ChatAnthropic instances"
-                ) from _LANGCHAIN_LLM_IMPORT_ERROR
-            llama_llm: Union[LangChainLLM, AnthropicMultiModal] = LangChainLLM(
-                llm=llm_to_use
-            )
-        else:
-            llama_llm = llm_to_use  # AnthropicMultiModal is already compatible
+        Note: Even in multimodal mode, we use the text LLM for the query engine
+        since RetrieverQueryEngine works with text synthesis. The multimodal
+        parsing is handled during document loading with LlamaParse.
+        """
+        if LangChainLLM is None:
+            raise ImportError(
+                "llama_index.llms.langchain is required to wrap ChatAnthropic instances"
+            ) from _LANGCHAIN_LLM_IMPORT_ERROR
+
+        # Always use ChatAnthropic (text LLM) for query engine
+        # Multimodal content is already processed during document parsing
+        llama_llm = LangChainLLM(llm=self.llm)
 
         self.query_engine = RetrieverQueryEngine.from_args(
             **{
@@ -1376,13 +1478,19 @@ class RAGPrototype(RAG):
         question: str,
         context: str,
     ) -> str:
-        """Generate answer (uses vision LLM if enabled)."""
+        """
+        Generate answer using the query engine.
+
+        Note: In multimodal mode, the multimodal content is already processed
+        during document parsing (LlamaParse). The query engine uses text-based
+        synthesis since it works with the text extracted from multimodal documents.
+        """
         if self.query_engine is not None:
             self._apply_direct_answer_template(question)
             response = self.query_engine.query(question)
             return self._post_process_answer(str(response))
 
-        # Fallback
+        # Fallback - use text LLM directly with provided context
         prompt = (
             "Answer in 1-3 sentences (max 50 words) with direct, no-preamble style.\n"
             "Start with 'You can', 'You must', 'To [action]', or the defined term.\n"
@@ -1396,14 +1504,9 @@ class RAGPrototype(RAG):
             "Answer:"
         )
 
-        # Use vision LLM if available and enabled
-        llm_to_use: Union[ChatAnthropic, AnthropicMultiModal] = (
-            self.vision_llm
-            if (self.config.enable_vision and self.vision_llm)
-            else self.llm
-        )
-
-        answer = llm_to_use.invoke(prompt)
+        # Always use ChatAnthropic (text LLM) for text generation
+        # Multimodal content has already been extracted during document parsing
+        answer = self.llm.invoke(prompt)
         if hasattr(answer, "content"):
             # type: ignore[return-value]
             return self._post_process_answer(answer.content)
