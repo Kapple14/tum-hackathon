@@ -14,35 +14,33 @@ The output maintains the same schema:
  faithfulness_score, faithfulness_eval}
 """
 
-from ai_eval.resources.rag_prototype import (
-    RAGPrototype,
-    RAGConfig,
-    RetrievalMode,
-    EmbeddingModel,
-    LLMModel,
-)
 import logging
 import os
 import sys
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Dict, Any, List
 
 from dotenv import load_dotenv
-from langchain.docstore.document import Document
 
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+# Ensure src/ is on PYTHONPATH before imports
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from ai_eval.resources.rag_prototype import (  # noqa: E402
+    EmbeddingModel,
+    LLMModel,
+    ParseMode,
+    RAGConfig,
+    RAGPrototype,
+    RetrievalMode,
+)
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-# Load environment variables
-load_dotenv()
 
 
 def load_qa_dataset(file_path: Path) -> List[Dict[str, Any]]:
@@ -59,88 +57,58 @@ def load_qa_dataset(file_path: Path) -> List[Dict[str, Any]]:
     return data
 
 
-def extract_documents_from_dataset(dataset: List[Dict[str, Any]]) -> List[Document]:
-    """Extract unique contexts as documents for the vectorstore."""
-    logger.info("Extracting unique contexts as documents...")
-
-    # Use a dict to deduplicate contexts
-    unique_contexts = {}
-    for item in dataset:
-        context = item.get("context", "").strip()
-        if context and context not in unique_contexts:
-            unique_contexts[context] = Document(
-                page_content=context,
-                metadata={
-                    "source": "generated_qa_data_tum",
-                    "index": item.get("index", -1)
-                }
-            )
-
-    documents = list(unique_contexts.values())
-    logger.info(f"Extracted {len(documents)} unique documents")
-    return documents
-
-
-def initialize_rag_system(documents: List[Document]) -> RAGPrototype:
-    """Initialize the RAG system with documents."""
-    logger.info("Initializing RAG system...")
-
-    # Check for required API keys
-    if not os.getenv("ANTHROPIC_API_KEY"):
+def validate_required_keys() -> None:
+    """Ensure mandatory env vars are present."""
+    required = {
+        "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY"),
+        "JINA_API_KEY": os.getenv("JINA_API_KEY"),
+        "QDRANT_API_KEY": os.getenv("QDRANT_API_KEY"),
+        "QDRANT_URL": os.getenv("QDRANT_URL"),
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
         raise RuntimeError(
-            "ANTHROPIC_API_KEY not found in environment. "
-            "Please set it in .env file."
+            "Missing required environment variables: "
+            + ", ".join(missing)
         )
+    logger.info("✅ All required API keys loaded successfully!")
 
-    if not os.getenv("JINA_API_KEY"):
-        raise RuntimeError(
-            "JINA_API_KEY not found in environment. "
-            "Please set it in .env file for embeddings."
-        )
 
-    if not os.getenv("QDRANT_URL"):
-        raise RuntimeError(
-            "QDRANT_URL not found in environment. "
-            "Please set it in .env file."
-        )
+def initialize_rag_system() -> RAGPrototype:
+    """
+    Initialize the multimodal RAG system using the Allplan manual,
+    mirroring the setup from dual_evaluator_rag_pipeline.ipynb.
+    """
 
-    if not os.getenv("QDRANT_API_KEY"):
-        raise RuntimeError(
-            "QDRANT_API_KEY not found in environment. "
-            "Please set it in .env file."
-        )
+    logger.info("Initializing multimodal RAG system with Allplan manual corpus...")
+    validate_required_keys()
 
-    # Configure RAG system for text-only mode
     config = RAGConfig(
-        retrieval_mode=RetrievalMode.TEXT_ONLY,
-        embedding_model=EmbeddingModel.JINA_V4,
+        retrieval_mode=RetrievalMode.MULTIMODAL,
+        parse_mode=ParseMode.MULTIMODAL_LVM,
+        enable_vision=True,
+        vision_llm_model=LLMModel.CLAUDE_SONNET_3_5,
         llm_model=LLMModel.CLAUDE_HAIKU_4_5,
-        top_k=3,  # Retrieve top 3 most relevant documents
+        embedding_model=EmbeddingModel.JINA_V4,
+        collection_name="allplan_docs_collection",
         chunk_size=1024,
         chunk_overlap=200,
-        collection_name="solution_generation",
-        force_recreate=False,  # Reuse existing embeddings if collection exists
+        top_k=5,
+        force_recreate=False,
     )
 
-    # Initialize RAG
-    rag = RAGPrototype(config)
-
-    # Deploy embeddings with the documents (only if not already deployed)
-    if not rag.is_deployed:
-        logger.info("Deploying embeddings...")
-        rag.deploy_embeddings(documents)
-    else:
-        logger.info("✅ Using existing embeddings from collection: %s",
-                    config.collection_name)
-
-    logger.info("RAG system initialized successfully")
+    rag = RAGPrototype(config=config)
+    rag.ensure_manual_embeddings()
+    logger.info("✅ RAG system initialized and ready for solution generation")
     return rag
 
 
 def main():
     """Main execution function."""
     # Define paths
-    project_root = Path(__file__).parent.parent
+    load_dotenv()
+
+    project_root = PROJECT_ROOT
     dataset_path = project_root / "data" / "generated_qa_data_tum.json"
     output_path = project_root / "data" / "solution.json"
 
@@ -152,11 +120,8 @@ def main():
         # Load dataset
         dataset = load_qa_dataset(dataset_path)
 
-        # Extract documents for RAG
-        documents = extract_documents_from_dataset(dataset)
-
         # Initialize RAG system
-        rag = initialize_rag_system(documents)
+        rag = initialize_rag_system()
 
         # Extract questions from dataset
         questions = [item.get("question", "") for item in dataset]

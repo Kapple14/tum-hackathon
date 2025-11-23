@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -21,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Uni
 
 import qdrant_client
 from langchain.docstore.document import Document
+from langchain.document_loaders import PyPDFLoader
 
 try:  # pragma: no cover - optional dependency
     from langchain_anthropic import ChatAnthropic
@@ -75,6 +77,10 @@ from ai_eval.prompts.anti_preamble import (
 from ai_eval.resources.rag_template import RAG
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_ALLPLAN_MANUAL_PATH = (
+    Path(__file__).resolve().parents[3] / "data" / "Allplan_2020_Manual.pdf"
+)
 
 
 class EmbeddingModel(str, Enum):
@@ -180,6 +186,10 @@ class RAGConfig(BaseSettings):
     force_recreate: bool = Field(
         default=False,
         description="Force recreate collection if it exists",
+    )
+    corpus_pdf_path: Path = Field(
+        default_factory=lambda: DEFAULT_ALLPLAN_MANUAL_PATH,
+        description="Path to Allplan 2020 Manual PDF used as the primary corpus",
     )
 
     # Retrieval mode settings
@@ -381,6 +391,21 @@ class RAGConfig(BaseSettings):
             raise ValueError("qdrant_url must start with http:// or https://")
         return v
 
+    @field_validator("corpus_pdf_path")
+    @classmethod
+    def validate_corpus_pdf_path(cls, v: Path) -> Path:
+        """Ensure the Allplan manual PDF exists."""
+        path = Path(v)
+        if not path.exists():
+            raise ValueError(
+                f"corpus_pdf_path does not exist: {path}"
+            )
+        if not path.is_file():
+            raise ValueError(
+                f"corpus_pdf_path must point to a file: {path}"
+            )
+        return path
+
     @computed_field
     @property
     def effective_chunk_size(self) -> int:
@@ -468,7 +493,7 @@ class RAGConfig(BaseSettings):
 
     def to_safe_dict(self) -> Dict[str, Any]:
         """Export configuration without sensitive data."""
-        return self.model_dump(
+        config = self.model_dump(
             exclude={
                 "qdrant_api_key",
                 "jina_api_key",
@@ -476,6 +501,9 @@ class RAGConfig(BaseSettings):
                 "llamaparse_api_key",
             }
         )
+        if "corpus_pdf_path" in config:
+            config["corpus_pdf_path"] = str(config["corpus_pdf_path"])
+        return config
 
     def save_to_file(self, path: Union[str, Path], include_computed: bool = True) -> None:
         """
@@ -647,6 +675,17 @@ class RAGPrototype(RAG):
         config.validate_config()
         self.config = config
 
+        # Always load the Allplan manual as the canonical knowledge base
+        self._default_documents: List[Document] = self._load_allplan_manual_documents(
+            self.config.corpus_pdf_path
+        )
+        if documents:
+            logger.warning(
+                "📚 Ignoring %d provided documents; using Allplan manual at %s instead",
+                len(documents),
+                self.config.corpus_pdf_path,
+            )
+
         # Initialize LLMs
         if llm is None:
             llm = self._create_llm()
@@ -665,7 +704,7 @@ class RAGPrototype(RAG):
         # Initialize parent RAG class
         super().__init__(
             llm=llm,
-            documents=documents or [],
+            documents=self._default_documents,
             k=config.top_k,
         )
 
@@ -804,6 +843,61 @@ class RAGPrototype(RAG):
             logger.error("❌ Error setting up vector store: %s", exc)
             raise
 
+    def _load_allplan_manual_documents(
+        self,
+        corpus_path: Optional[Union[str, Path]] = None,
+    ) -> List[Document]:
+        """
+        Load the Allplan 2020 manual PDF into LangChain Documents.
+
+        Args:
+            corpus_path: Optional override for the manual path.
+
+        Returns:
+            List of Documents, one per PDF page.
+        """
+        path = Path(corpus_path) if corpus_path else Path(
+            self.config.corpus_pdf_path)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"❌ Allplan manual PDF not found at {path}. Update corpus_pdf_path."
+            )
+
+        loader = PyPDFLoader(str(path))
+        pages = loader.load()
+        documents: List[Document] = []
+
+        for idx, page in enumerate(pages, start=1):
+            metadata = dict(getattr(page, "metadata", {}) or {})
+            metadata.update(
+                {
+                    "source": path.name,
+                    "source_path": str(path),
+                    "page": metadata.get("page", idx),
+                    "collection": self.config.collection_name,
+                }
+            )
+            documents.append(
+                Document(
+                    page_content=page.page_content,
+                    metadata=metadata,
+                )
+            )
+
+        logger.info(
+            "📖 Loaded %d pages from Allplan manual at %s",
+            len(documents),
+            path,
+        )
+        return documents
+
+    def ensure_manual_embeddings(self) -> None:
+        """Deploy embeddings for the Allplan manual if not already available."""
+        if self._is_deployed:
+            return
+        logger.info("📦 Deploying Allplan manual corpus to Qdrant...")
+        self.deploy_embeddings()
+
     def switch_to_multimodal(
         self,
         enable_vision: bool = True,
@@ -922,7 +1016,8 @@ class RAGPrototype(RAG):
 
     def deploy_embeddings(
         self,
-        documents: Union[List[Document], List[LlamaIndexDocument]],
+        documents: Optional[Union[List[Document],
+                                  List[LlamaIndexDocument]]] = None,
         force_redeploy: bool = False,
         clear_existing: bool = True,
     ) -> Optional[DeploymentMetadata]:
@@ -943,8 +1038,15 @@ class RAGPrototype(RAG):
                 "⚠️  Already deployed. Use force_redeploy=True to recreate.")
             return self.deployment_metadata
 
-        if not documents:
-            raise ValueError("❌ No documents provided")
+        if documents:
+            logger.warning(
+                "📚 deploy_embeddings received %d external documents; overriding with Allplan manual corpus at %s",
+                len(documents),
+                self.config.corpus_pdf_path,
+            )
+        docs_to_index = self._default_documents
+        if not docs_to_index:
+            raise ValueError("❌ No documents available for deployment")
 
         # Handle redeployment
         if self._is_deployed and force_redeploy:
@@ -957,13 +1059,13 @@ class RAGPrototype(RAG):
         logger.info(
             "🚀 Starting %s embedding deployment for %s documents",
             "multimodal" if self.config.is_multimodal else "text",
-            len(documents),
+            len(docs_to_index),
         )
         start_time = datetime.now()
 
         try:
             # Convert to LlamaIndex documents
-            llama_docs = self._convert_to_llama_documents(documents)
+            llama_docs = self._convert_to_llama_documents(docs_to_index)
 
             # Parse into nodes (may include image nodes)
             logger.info("📝 Chunking documents into nodes...")
@@ -1048,7 +1150,7 @@ class RAGPrototype(RAG):
 
             self.deployment_metadata = DeploymentMetadata(
                 collection_name=self.config.collection_name,
-                num_documents=len(documents),
+                num_documents=len(docs_to_index),
                 num_nodes=0,
                 embedding_model=self.config.embedding_model.value,
                 embedding_dim=self.config.embedding_dim,
@@ -1550,6 +1652,80 @@ class RAGPrototype(RAG):
 
         return qa_item
 
+    @staticmethod
+    def _strip_code_fences(text: str) -> str:
+        """Remove markdown code fences from LLM responses."""
+        if not isinstance(text, str):
+            return ""
+        cleaned = text.strip()
+        fence_match = re.search(
+            r"```(?:json|JSON)?\s*(.*?)\s*```", cleaned, re.DOTALL)
+        if fence_match:
+            return fence_match.group(1).strip()
+        return cleaned
+
+    @staticmethod
+    def _normalize_score_value(score: Any, default: int = 3) -> int:
+        """Convert score to int within [1, 5]."""
+        value: Optional[int] = None
+        if isinstance(score, (int, float)):
+            value = int(score)
+        else:
+            match = re.search(r"(\d)", str(score))
+            if match:
+                value = int(match.group(1))
+        if value is None:
+            value = default
+        return max(1, min(5, value))
+
+    @classmethod
+    def _plain_text_explanation(cls, text: str) -> str:
+        """Return plain-text explanation without JSON artifacts."""
+        cleaned = cls._strip_code_fences(text)
+        cleaned = re.sub(r"[{}\[\]\"']", "", cleaned)
+        cleaned = re.sub(r"\bscore\s*:\s*\d+/?\d*", "",
+                         cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bexplanation\s*:\s*", "",
+                         cleaned, flags=re.IGNORECASE)
+        cleaned = cleaned.strip()
+        return cleaned or "No explanation provided."
+
+    def _parse_eval_response(
+        self,
+        response_text: str,
+        default_score: int = 3,
+    ) -> Dict[str, Any]:
+        """Parse evaluator LLM response into score + explanation."""
+        cleaned = self._strip_code_fences(response_text)
+        candidate = cleaned
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = candidate[start:end + 1]
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            logger.warning(
+                "Failed to parse evaluation JSON; using fallback text: %s",
+                cleaned[:120],
+            )
+            return {
+                "score": default_score,
+                "explanation": self._plain_text_explanation(cleaned),
+            }
+
+        score = self._normalize_score_value(
+            data.get("score", default_score), default_score)
+        explanation_source = data.get("explanation", "")
+        explanation = self._plain_text_explanation(
+            explanation_source if explanation_source else cleaned
+        )
+
+        return {
+            "score": score,
+            "explanation": explanation,
+        }
+
     def _evaluate_groundedness(
         self,
         question: str,
@@ -1597,19 +1773,7 @@ Only return the JSON object, no additional text."""
         response_text = response.content if hasattr(
             response, "content") else str(response)
 
-        try:
-            result = json.loads(response_text)
-            return {
-                "score": max(1, min(5, result.get("score", 3))),
-                "explanation": result.get("explanation", ""),
-            }
-        except json.JSONDecodeError:
-            logger.warning(
-                "Failed to parse groundedness evaluation: %s", response_text[:100])
-            return {
-                "score": 3,
-                "explanation": response_text[:200],
-            }
+        return self._parse_eval_response(response_text)
 
     def _evaluate_question_relevancy(
         self,
@@ -1648,19 +1812,7 @@ Only return the JSON object, no additional text."""
         response_text = response.content if hasattr(
             response, "content") else str(response)
 
-        try:
-            result = json.loads(response_text)
-            return {
-                "score": max(1, min(5, result.get("score", 3))),
-                "explanation": result.get("explanation", ""),
-            }
-        except json.JSONDecodeError:
-            logger.warning(
-                "Failed to parse relevancy evaluation: %s", response_text)
-            return {
-                "score": 3,
-                "explanation": response_text[:200],
-            }
+        return self._parse_eval_response(response_text)
 
     def _evaluate_faithfulness(
         self,
@@ -1704,19 +1856,7 @@ Only return the JSON object, no additional text."""
         response_text = response.content if hasattr(
             response, "content") else str(response)
 
-        try:
-            result = json.loads(response_text)
-            return {
-                "score": max(1, min(5, result.get("score", 3))),
-                "explanation": result.get("explanation", ""),
-            }
-        except json.JSONDecodeError:
-            logger.warning(
-                "Failed to parse faithfulness evaluation: %s", response_text)
-            return {
-                "score": 3,
-                "explanation": response_text[:200],
-            }
+        return self._parse_eval_response(response_text)
 
     def generate_qa_dataset(
         self,
@@ -1823,7 +1963,9 @@ Only return the JSON object, no additional text."""
         question_relevancy_eval, faithfulness_score, faithfulness_eval}.
 
         Results are saved as they become available (streaming mode) rather than
-        waiting for all to complete.
+        waiting for all to complete. The Allplan 2020 Manual (``data/Allplan_2020_Manual.pdf``)
+        is used as the exclusive retrieval corpus; the reference dataset only contributes
+        the list of questions to evaluate.
 
         Args:
             reference_dataset_path: Source dataset to copy questions from.
@@ -1835,6 +1977,7 @@ Only return the JSON object, no additional text."""
         Returns:
             List of QADataItem objects produced by the RAG pipeline.
         """
+        self.ensure_manual_embeddings()
         self._ensure_deployed()
 
         reference_path = Path(reference_dataset_path)
