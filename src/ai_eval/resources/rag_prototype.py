@@ -310,7 +310,7 @@ class RAGConfig(BaseSettings):
 
     # Response settings
     response_mode: ResponseModeType = Field(
-        default=ResponseModeType.COMPACT,
+        default=ResponseModeType.REFINE,
         description="Response synthesis mode",
     )
     streaming: bool = Field(
@@ -318,7 +318,7 @@ class RAGConfig(BaseSettings):
         description="Enable streaming responses",
     )
     use_direct_answer_prompts: bool = Field(
-        default=False,
+        default=True,
         description="Use anti-preamble Allplan prompt templates for concise answers",
     )
 
@@ -1303,7 +1303,8 @@ class RAGPrototype(RAG):
 
         answer = llm_to_use.invoke(prompt)
         if hasattr(answer, "content"):
-            return self._post_process_answer(answer.content)  # type: ignore[return-value]
+            # type: ignore[return-value]
+            return self._post_process_answer(answer.content)
         return self._post_process_answer(str(answer))
 
     def answer(
@@ -1800,6 +1801,199 @@ Only return the JSON object, no additional text."""
         )
 
         return qa_dataset
+
+    def generate_solution_file(
+        self,
+        reference_dataset_path: Union[str, Path] = Path(
+            "data/generated_qa_data_tum.json"),
+        output_path: Union[str, Path] = Path("data/solution.json"),
+        limit: Optional[int] = None,
+        overwrite: bool = True,
+        show_progress: bool = True,
+    ) -> List[QADataItem]:
+        """
+        Rebuild answers for an existing dataset strictly from RAG outputs.
+
+        The method reuses the questions (and indices) found in the provided
+        reference dataset, calls the live RAG pipeline for each question, and
+        saves the regenerated records incrementally to ``solution.json`` (or the 
+        supplied output path) using the exact schema used in generated_qa_data_tum.json:
+        {index, question, answer, location_dependency_evaluator_target_answer,
+        context, groundedness_score, groundedness_eval, question_relevancy_score,
+        question_relevancy_eval, faithfulness_score, faithfulness_eval}.
+
+        Results are saved as they become available (streaming mode) rather than
+        waiting for all to complete.
+
+        Args:
+            reference_dataset_path: Source dataset to copy questions from.
+            output_path: Destination JSON file for regenerated answers.
+            limit: Optional cap on the number of questions to process.
+            overwrite: If False, refuse to overwrite an existing output file.
+            show_progress: Emit progress logs for each processed question.
+
+        Returns:
+            List of QADataItem objects produced by the RAG pipeline.
+        """
+        self._ensure_deployed()
+
+        reference_path = Path(reference_dataset_path)
+        if not reference_path.exists():
+            raise FileNotFoundError(
+                f"❌ Reference dataset not found: {reference_path}")
+
+        with open(reference_path, "r", encoding="utf-8") as f:
+            reference_data = json.load(f)
+
+        if not isinstance(reference_data, list):
+            raise ValueError(
+                "❌ Reference dataset must be a list of QA records")
+
+        entries = reference_data[:limit] if limit else reference_data
+        qa_items: List[QADataItem] = []
+
+        output_path = Path(output_path)
+        if output_path.exists() and not overwrite:
+            raise FileExistsError(
+                f"❌ Output file already exists: {output_path}")
+
+        # Ensure output directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        logger.info(
+            "🧠 Regenerating answers for %d questions using RAG",
+            len(entries),
+        )
+        logger.info("💾 Streaming results to: %s", output_path)
+
+        # Initialize output file with opening bracket
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("[\n")
+
+        errors = 0
+        processed_count = 0  # Track number of successfully processed items
+        first_item_written = False
+
+        for idx, entry in enumerate(entries):
+            question = entry.get("question")
+            if not question:
+                logger.warning(
+                    "⚠️  Skipping entry %d: missing 'question' field", idx)
+                errors += 1
+                continue
+
+            item_index = entry.get("index", idx)
+
+            if show_progress:
+                logger.info("   [%d/%d] Processing: %s", idx + 1, len(entries),
+                            question[:80])
+
+            try:
+                qa_item = self.generate_qa_data(
+                    question=question,
+                    index=item_index,
+                )
+                qa_items.append(qa_item)
+                processed_count += 1
+
+                # Save this item immediately to file
+                logger.info("   ✅ [%d] Saving item %d to file...",
+                            processed_count, item_index)
+                self._append_qa_item_to_file(
+                    output_path,
+                    qa_item,
+                    prepend_comma=first_item_written
+                )
+                if not first_item_written:
+                    first_item_written = True
+
+            except Exception as e:
+                errors += 1
+                logger.error(
+                    "❌ Error generating QA data for item %d: %s",
+                    item_index,
+                    e,
+                    exc_info=False
+                )
+                continue
+
+        # Close the JSON array
+        with open(output_path, "a", encoding="utf-8") as f:
+            f.write("\n]\n")
+
+        logger.info("✅ JSON file closed and finalized at: %s", output_path)
+
+        success_count = len(qa_items)
+        success_rate = (success_count / len(entries) *
+                        100) if len(entries) > 0 else 0
+
+        logger.info(
+            "✅ Saved RAG-generated solutions to %s\n"
+            "   Total: %d\n"
+            "   Successful: %d\n"
+            "   Errors: %d\n"
+            "   Success rate: %.1f%%",
+            output_path,
+            len(entries),
+            success_count,
+            errors,
+            success_rate,
+        )
+
+        return qa_items
+
+    def _append_qa_item_to_file(
+        self,
+        file_path: Path,
+        qa_item: QADataItem,
+        prepend_comma: bool = False,
+    ) -> None:
+        """
+        Append a single QA item to the solution JSON file in real-time.
+
+        This maintains valid JSON format with proper comma placement and exact
+        indentation matching generated_qa_data_tum.json (2 spaces base, 4 spaces for properties).
+
+        Entries are appended to the file immediately upon generation, allowing for
+        real-time monitoring and partial recovery if the process is interrupted.
+
+        Args:
+            file_path: Path to the JSON file
+            qa_item: QADataItem to append
+            prepend_comma: Whether to prepend a separating comma before the item
+        """
+        # Get the item as a dictionary
+        item_dict = qa_item.model_dump()
+
+        # Convert to JSON string with proper formatting
+        item_json = json.dumps(item_dict, indent=4, ensure_ascii=False)
+
+        # Add proper base indentation (2 spaces for array items)
+        lines = item_json.split('\n')
+        indented_lines = ['  ' + line for line in lines]
+        formatted_item = '\n'.join(indented_lines)
+
+        try:
+            # Append to file with proper comma
+            with open(file_path, "a", encoding="utf-8") as f:
+                if prepend_comma:
+                    f.write(",\n")
+                f.write(formatted_item)
+
+            logger.debug(
+                "📝 Appended QA item (index=%d) to: %s",
+                qa_item.index,
+                file_path
+            )
+
+        except IOError as e:
+            logger.error(
+                "❌ Failed to append item to file %s: %s",
+                file_path,
+                e,
+                exc_info=False
+            )
+            raise
 
     def save_qa_dataset(
         self,
